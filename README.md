@@ -6,7 +6,9 @@ keeps your board glued to it while the camera dives in forever — steer along
 the edge for score, or peel out to open water to catch your breath. There's
 no way to lose; it's just an endless dive.
 
-<video src="https://raw.githubusercontent.com/reivash/mandelsurf/main/screenshots/gameplay.mp4" controls muted playsinline width="100%"></video>
+![Gameplay preview](screenshots/gameplay-preview.gif)
+
+([full clip with sound](screenshots/gameplay.mp4) — GitHub doesn't play embedded video in READMEs, so this is a GIF preview; click through for the real thing)
 
 ![Riding the coastline of a mini-brot](screenshots/gameplay-1.jpg)
 

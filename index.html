@@ -9,6 +9,7 @@
 <body>
   <div id="stage">
     <canvas id="fractal"></canvas>
+    <canvas id="fractalGL" class="hidden"></canvas>
     <canvas id="fx"></canvas>
 
     <div id="hud" class="hidden">
@@ -34,12 +35,14 @@
         <div class="legend">
           <span class="key">WASD</span> / <span class="key">&larr;&uarr;&darr;&rarr;</span> steer
           &nbsp;&nbsp;<span class="key">SHIFT</span>/<span class="key">SPACE</span> boost
+          &nbsp;&nbsp;<span class="key">F</span> free-fly
           &nbsp;&nbsp;<span class="key">P</span> pause
         </div>
       </div>
     </div>
 
     <div id="reefBadge" class="hidden">Reef <span id="reefNum">1</span></div>
+    <div id="freeModeBadge" class="hidden">FREE MODE — press <span class="key">F</span> to reconnect to the rim</div>
 
     <div id="startScreen" class="overlay">
       <div class="panel">
@@ -48,7 +51,29 @@
         <div class="controls-list">
           <div><span class="key">&larr; &uarr; &darr; &rarr;</span> / <span class="key">WASD</span> steer</div>
           <div><span class="key">SHIFT</span> / <span class="key">SPACE</span> boost</div>
+          <div><span class="key">F</span> toggle free-fly (disable rim snapping)</div>
           <div><span class="key">P</span> pause</div>
+        </div>
+        <div class="quality-select" data-quality-group="start">
+          <div class="quality-label">RENDER QUALITY <span class="quality-hint">(internal resolution)</span></div>
+          <div class="quality-row">
+            <button class="qbtn" data-quality="auto">AUTO</button>
+            <button class="qbtn" data-quality="low">LOW</button>
+            <button class="qbtn" data-quality="medium">MED</button>
+            <button class="qbtn" data-quality="high">HIGH</button>
+            <button class="qbtn" data-quality="ultra">ULTRA</button>
+            <button class="qbtn" data-quality="gpu" data-gpu-btn>GPU</button>
+          </div>
+          <div class="quality-caption" data-quality-caption>Automatically balances resolution for a smooth framerate.</div>
+          <div class="quality-gpu-status" data-gpu-status></div>
+        </div>
+        <div class="quality-select">
+          <div class="quality-label">PALETTE</div>
+          <div class="quality-row">
+            <button class="qbtn" data-palette="time">CLASSIC</button>
+            <button class="qbtn" data-palette="depth">DEPTH SHIFT</button>
+          </div>
+          <div class="quality-caption" data-palette-caption>Color drifts slowly over time.</div>
         </div>
         <button id="startBtn" class="btn">PADDLE OUT</button>
         <p class="hint">Steer toward the reef for foam and big score. Steer away for calmer open water.</p>
@@ -58,6 +83,27 @@
     <div id="pauseScreen" class="overlay hidden">
       <div class="panel">
         <h2>PAUSED</h2>
+        <div class="quality-select" data-quality-group="pause">
+          <div class="quality-label">RENDER QUALITY <span class="quality-hint">(internal resolution)</span></div>
+          <div class="quality-row">
+            <button class="qbtn" data-quality="auto">AUTO</button>
+            <button class="qbtn" data-quality="low">LOW</button>
+            <button class="qbtn" data-quality="medium">MED</button>
+            <button class="qbtn" data-quality="high">HIGH</button>
+            <button class="qbtn" data-quality="ultra">ULTRA</button>
+            <button class="qbtn" data-quality="gpu" data-gpu-btn>GPU</button>
+          </div>
+          <div class="quality-caption" data-quality-caption>Automatically balances resolution for a smooth framerate.</div>
+          <div class="quality-gpu-status" data-gpu-status></div>
+        </div>
+        <div class="quality-select">
+          <div class="quality-label">PALETTE</div>
+          <div class="quality-row">
+            <button class="qbtn" data-palette="time">CLASSIC</button>
+            <button class="qbtn" data-palette="depth">DEPTH SHIFT</button>
+          </div>
+          <div class="quality-caption" data-palette-caption>Color drifts slowly over time.</div>
+        </div>
         <button id="resumeBtn" class="btn">RESUME</button>
         <button id="restartBtn" class="btn btn-secondary">RESTART</button>
       </div>

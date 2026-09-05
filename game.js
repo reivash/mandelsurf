@@ -7,6 +7,7 @@
 
 const fractalCanvas = document.getElementById('fractal');
 const fctx = fractalCanvas.getContext('2d', { alpha: false });
+const fractalGLCanvas = document.getElementById('fractalGL');
 const fxCanvas = document.getElementById('fx');
 const xctx = fxCanvas.getContext('2d');
 
@@ -18,12 +19,15 @@ const bestVal = document.getElementById('bestVal');
 const boostFill = document.getElementById('boostFill');
 const reefBadge = document.getElementById('reefBadge');
 const reefNum = document.getElementById('reefNum');
+const freeModeBadge = document.getElementById('freeModeBadge');
 
 const startScreen = document.getElementById('startScreen');
 const pauseScreen = document.getElementById('pauseScreen');
 const startBtn = document.getElementById('startBtn');
 const resumeBtn = document.getElementById('resumeBtn');
 const restartBtn = document.getElementById('restartBtn');
+const qualityButtons = document.querySelectorAll('.qbtn[data-quality]');
+const paletteButtons = document.querySelectorAll('.qbtn[data-palette]');
 
 
 // ============================================================
@@ -106,8 +110,20 @@ const CFG = {
   pixelBudgetBase: 65000,
   qualityMin: 0.45,
   qualityMax: 1.3,
+  qualityPresets: { low: 0.35, medium: 0.85, high: 1.3, ultra: 2.1 },
   maxIterBase: 90,
   maxIterCap: 340,
+  maxIterCapGPU: 1200, // GPU can afford far more iterations than the CPU gameplay pass
+  // The double-single emulation degrades into visible banding well before its
+  // theoretical range, on at least some GPU/driver combinations (almost
+  // certainly the shader compiler fusing the error-cancellation subtractions
+  // in dsMul into a single fused-multiply-add, which silently destroys the
+  // rounding-error term the whole trick depends on - a known hazard for this
+  // technique, and not something a web page can disable in the compiler).
+  // Rather than risk showing broken graphics, the GPU renderer automatically
+  // hands back off to the CPU beyond a conservatively safe depth; it resumes
+  // once shallow again (e.g. after the next reef).
+  gpuMaxSafeZoom: 3e4,
   zoomRateStart: 1.18,      // per second, multiplicative
   zoomRateBoostMul: 1.7,
   zoomRateGrowthPerSec: 0.0028, // slow difficulty ramp
@@ -141,6 +157,9 @@ const CFG = {
   boostDrainRate: 42,
   boostRegenRate: 16,
   boostMinToStart: 6,
+
+  hueTimeRate: 0.01,          // classic palette: slow color drift over real time
+  hueRotateDecadesPerCycle: 2.5, // depth-shift palette: one full rainbow rotation every N decades of zoom
 };
 
 // ============================================================
@@ -173,6 +192,9 @@ const S = {
   reefCount: 1,
   maxDepthReached: 0,
   quality: 0.85,
+  qualityMode: 'auto', // 'auto' | 'low' | 'medium' | 'high' | 'ultra' | 'gpu'
+  paletteMode: 'time', // 'time' (slow classic drift) | 'depth' (color shifts with zoom depth)
+  freeMode: false,     // when true, ignores the coastline entirely - pure free-fly repositioning
   seedIndex: 0,
   transitionT: 0,
   transitionDur: 1.1,
@@ -182,6 +204,7 @@ const S = {
   lastFrameMs: 16,
   perfCheckTimer: 0,
   hueShift: 0,
+  hueRotate: 0, // depth-shift palette: current hue-rotation angle (radians), post-processed onto the final color
 };
 
 bestVal.textContent = Math.floor(S.best).toLocaleString();
@@ -200,6 +223,15 @@ let fxW = 0, fxH = 0, dpr = 1;
 // particles: {x,y,vx,vy,life,maxLife,size,r,g,b,kind}
 let particles = [];
 
+// GPU (WebGL) rendering state - declared here (ahead of resize(), which can
+// call into resizeGL() before the GPU setup block below has run) so there's
+// no temporal-dead-zone gap between "resize() first runs" and "gl exists".
+let gl = null;
+let glProgram = null;
+let glSupported = false;
+let glRendererName = '';
+let glUniforms = {};
+
 // ============================================================
 // Resize
 // ============================================================
@@ -214,6 +246,7 @@ function resize() {
   xctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   recomputeInternalRes(w / h);
+  resizeGL();
 }
 
 function recomputeInternalRes(aspect) {
@@ -237,6 +270,251 @@ function recomputeInternalRes(aspect) {
 window.addEventListener('resize', resize);
 resize();
 window.addEventListener('load', resize);
+
+// ============================================================
+// GPU (WebGL) rendering. Optional, purely visual: it draws the same
+// Mandelbrot at full device resolution on a second canvas layered above the
+// CPU one. The CPU renderFractal() below keeps running unconditionally at
+// its own (much lower) internal resolution regardless of which one is on
+// screen - gameplay (the rim line, movement, collision) is entirely driven
+// by that CPU buffer and must never depend on whether GPU rendering is
+// active. A plain float32 shader runs out of precision around ~1e5-1e6x
+// zoom (single-precision has ~7 decimal digits, and at depth the pixel-to-
+// pixel coordinate delta needs far more than that to not collapse into the
+// same float). So the shader emulates double precision with a classic
+// "double-single" trick: every plane coordinate is carried as two float32s
+// (a value and a residual), giving ~30 bits of extra mantissa - enough to
+// get within range of the CPU's own double-precision depth limit.
+// ============================================================
+
+function splitDouble(value) {
+  const hi = Math.fround(value);
+  const lo = Math.fround(value - hi);
+  return [hi, lo];
+}
+
+function compileShader(kind, src) {
+  const sh = gl.createShader(kind);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    const info = gl.getShaderInfoLog(sh);
+    gl.deleteShader(sh);
+    throw new Error('shader compile failed: ' + info);
+  }
+  return sh;
+}
+
+const GL_VERTEX_SRC = `
+attribute vec2 aPos;
+void main() {
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}
+`;
+
+// Double-single (two float32s per value) arithmetic, the standard
+// Dekker/Knuth error-free-transformation trick, ported to GLSL.
+const GL_FRAGMENT_SRC = `
+precision highp float;
+
+uniform vec2 uCenterX;
+uniform vec2 uCenterY;
+uniform vec2 uScale;
+uniform vec2 uResolution;
+uniform float uMaxIter;
+uniform float uHueShift;
+uniform float uHueRotate;
+
+vec2 dsAdd(vec2 a, vec2 b) {
+  float t1 = a.x + b.x;
+  float e = t1 - a.x;
+  float t2 = ((b.x - e) + (a.x - (t1 - e))) + a.y + b.y;
+  float r0 = t1 + t2;
+  float r1 = t2 - (r0 - t1);
+  return vec2(r0, r1);
+}
+
+vec2 dsNeg(vec2 a) { return vec2(-a.x, -a.y); }
+vec2 dsSub(vec2 a, vec2 b) { return dsAdd(a, dsNeg(b)); }
+
+vec2 dsMul(vec2 a, vec2 b) {
+  const float split = 4097.0; // 2^12 + 1
+  float cona = a.x * split, conb = b.x * split;
+  float a1 = cona - (cona - a.x), b1 = conb - (conb - b.x);
+  float a2 = a.x - a1, b2 = b.x - b1;
+  float c11 = a.x * b.x;
+  float c21 = a2 * b2 - (((c11 - a1 * b1) - a2 * b1) - a1 * b2);
+  float c2 = a.x * b.y + a.y * b.x;
+  float t1 = c11 + c2;
+  float e = t1 - c11;
+  float t2 = a.y * b.y + ((c2 - e) + (c11 - (t1 - e))) + c21;
+  float r0 = t1 + t2;
+  float r1 = t2 - (r0 - t1);
+  return vec2(r0, r1);
+}
+
+float hash2f(vec2 p) {
+  return fract(sin(dot(p, vec2(374.761, 668.265))) * 43758.5453123);
+}
+
+vec3 rockColor(vec2 fragCoord) {
+  float n = hash2f(floor(fragCoord));
+  float shade = 8.0 + n * 22.0;
+  return vec3(shade * 0.7, shade * 0.85 + 4.0, shade * 1.05 + 10.0) / 255.0;
+}
+
+vec3 paletteColor(float t, float maxIter, float hueShift) {
+  float ratio = t / maxIter;
+  float tt = sqrt(max(0.0, ratio)) * 7.5 + hueShift;
+  float TAU = 6.28318530718;
+  float r = 0.35 + 0.35 * cos(TAU * (0.9 * tt + 0.55));
+  float g = 0.55 + 0.4 * cos(TAU * (0.7 * tt + 0.6));
+  float b = 0.75 + 0.25 * cos(TAU * (0.5 * tt + 0.68));
+  r *= 0.75;
+  g = g * 0.95 + 0.05;
+  b = b * 1.0 + 0.12;
+  float foamRatio = 0.86;
+  if (ratio > foamRatio) {
+    float f = (ratio - foamRatio) / (1.0 - foamRatio);
+    r += f * 0.9; g += f * 0.9; b += f * 0.85;
+  }
+  return clamp(vec3(r, g, b), 0.0, 1.0);
+}
+
+// Standard SVG/CSS hue-rotate matrix - see the matching applyHueRotate() in
+// game.js. Keeps GPU and CPU rendering visually identical in depth-shift mode.
+vec3 hueRotate(vec3 col, float angle) {
+  float c = cos(angle), s = sin(angle);
+  mat3 m = mat3(
+    0.213 + c * 0.787 - s * 0.213, 0.213 - c * 0.213 + s * 0.143, 0.213 - c * 0.213 - s * 0.787,
+    0.715 - c * 0.715 - s * 0.715, 0.715 + c * 0.285 + s * 0.140, 0.715 - c * 0.715 + s * 0.715,
+    0.072 - c * 0.072 + s * 0.928, 0.072 - c * 0.072 - s * 0.283, 0.072 + c * 0.928 + s * 0.072
+  );
+  return clamp(m * col, 0.0, 1.0);
+}
+
+void main() {
+  float px = gl_FragCoord.x - uResolution.x * 0.5;
+  float py = (uResolution.y - gl_FragCoord.y) - uResolution.y * 0.5;
+
+  vec2 x0 = dsAdd(uCenterX, dsMul(vec2(px, 0.0), uScale));
+  vec2 y0 = dsAdd(uCenterY, dsMul(vec2(py, 0.0), uScale));
+
+  vec2 x = vec2(0.0);
+  vec2 y = vec2(0.0);
+  vec2 x2 = vec2(0.0);
+  vec2 y2 = vec2(0.0);
+  float iter = 0.0;
+  bool escaped = false;
+
+  for (int i = 0; i < ${CFG.maxIterCapGPU}; i++) {
+    if (float(i) >= uMaxIter) break;
+    if (x2.x + y2.x > 4.0) { escaped = true; break; }
+    vec2 xy = dsMul(x, y);
+    y = dsAdd(dsAdd(xy, xy), y0);
+    x = dsAdd(dsSub(x2, y2), x0);
+    x2 = dsMul(x, x);
+    y2 = dsMul(y, y);
+    iter += 1.0;
+  }
+
+  vec3 col;
+  if (!escaped) {
+    col = rockColor(gl_FragCoord.xy);
+  } else {
+    float magf = x2.x + y2.x;
+    float logZn = log(magf) * 0.5;
+    float nu = log(logZn / 0.6931471805599453) / 0.6931471805599453;
+    float smoothIter = max(0.0, iter + 1.0 - nu);
+    col = paletteColor(smoothIter, uMaxIter, uHueShift);
+  }
+  if (uHueRotate != 0.0) col = hueRotate(col, uHueRotate);
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+function initGL() {
+  try {
+    gl = fractalGLCanvas.getContext('webgl', { alpha: false, antialias: false, depth: false, stencil: false, preserveDrawingBuffer: true })
+      || fractalGLCanvas.getContext('experimental-webgl');
+  } catch (e) { gl = null; }
+  if (!gl) { glSupported = false; return; }
+
+  try {
+    const vs = compileShader(gl.VERTEX_SHADER, GL_VERTEX_SRC);
+    const fs = compileShader(gl.FRAGMENT_SHADER, GL_FRAGMENT_SRC);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      throw new Error('program link failed: ' + gl.getProgramInfoLog(prog));
+    }
+    glProgram = prog;
+    gl.useProgram(prog);
+
+    const posBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    // one oversized triangle covering the whole clip space - cheaper than a quad
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    glUniforms.centerX = gl.getUniformLocation(prog, 'uCenterX');
+    glUniforms.centerY = gl.getUniformLocation(prog, 'uCenterY');
+    glUniforms.scale = gl.getUniformLocation(prog, 'uScale');
+    glUniforms.resolution = gl.getUniformLocation(prog, 'uResolution');
+    glUniforms.maxIter = gl.getUniformLocation(prog, 'uMaxIter');
+    glUniforms.hueShift = gl.getUniformLocation(prog, 'uHueShift');
+    glUniforms.hueRotate = gl.getUniformLocation(prog, 'uHueRotate');
+
+    glSupported = true;
+  } catch (e) {
+    console.warn('WebGL unavailable, falling back to CPU rendering:', e);
+    glSupported = false;
+    gl = null;
+    return;
+  }
+
+  try {
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    if (dbg) glRendererName = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));
+  } catch (e) { /* renderer name is best-effort only */ }
+}
+
+function resizeGL() {
+  if (!gl) return;
+  const w = Math.max(1, Math.round((window.innerWidth || 400) * dpr));
+  const h = Math.max(1, Math.round((window.innerHeight || 700) * dpr));
+  if (fractalGLCanvas.width !== w || fractalGLCanvas.height !== h) {
+    fractalGLCanvas.width = w;
+    fractalGLCanvas.height = h;
+  }
+  gl.viewport(0, 0, w, h);
+}
+
+function renderFractalGPU() {
+  if (!gl || !glProgram) return;
+  const scale = CFG.span / (S.zoomFactor * fractalGLCanvas.width);
+  const cxS = splitDouble(S.cx), cyS = splitDouble(S.cy), scS = splitDouble(scale);
+  const maxIter = clamp(
+    Math.round((CFG.maxIterBase + 16 * Math.log2(S.zoomFactor + 1)) * 1.6),
+    60, CFG.maxIterCapGPU
+  );
+  gl.useProgram(glProgram);
+  gl.uniform2f(glUniforms.centerX, cxS[0], cxS[1]);
+  gl.uniform2f(glUniforms.centerY, cyS[0], cyS[1]);
+  gl.uniform2f(glUniforms.scale, scS[0], scS[1]);
+  gl.uniform2f(glUniforms.resolution, fractalGLCanvas.width, fractalGLCanvas.height);
+  gl.uniform1f(glUniforms.maxIter, maxIter);
+  gl.uniform1f(glUniforms.hueShift, S.hueShift);
+  gl.uniform1f(glUniforms.hueRotate, S.hueRotate);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+initGL();
+resizeGL();
 
 // ============================================================
 // Mandelbrot core
@@ -309,6 +587,18 @@ function paletteColor(t, maxIter, out) {
 
 function clamp255(v) { return v < 0 ? 0 : v > 255 ? 255 : v | 0; }
 
+// Standard SVG/CSS hue-rotate matrix (rotates hue while preserving each
+// color's own brightness/contrast pattern) - used by the depth-shift palette
+// to slide the whole scene's hue as a function of zoom depth, independent of
+// the underlying ocean-palette shading.
+function applyHueRotate(col, c, s) {
+  const r = col[0], g = col[1], b = col[2];
+  const nr = (0.213 + c * 0.787 - s * 0.213) * r + (0.715 - c * 0.715 - s * 0.715) * g + (0.072 - c * 0.072 + s * 0.928) * b;
+  const ng = (0.213 - c * 0.213 + s * 0.143) * r + (0.715 + c * 0.285 + s * 0.140) * g + (0.072 - c * 0.072 - s * 0.283) * b;
+  const nb = (0.213 - c * 0.213 - s * 0.787) * r + (0.715 - c * 0.715 + s * 0.715) * g + (0.072 + c * 0.928 + s * 0.072) * b;
+  col[0] = clamp255(nr); col[1] = clamp255(ng); col[2] = clamp255(nb);
+}
+
 function hash2(ix, iy) {
   let h = (ix * 374761393 + iy * 668265263) | 0;
   h = (h ^ (h >>> 13)) * 1274126177;
@@ -338,6 +628,9 @@ function renderFractal() {
   );
   cachedMaxIter = maxIter;
 
+  const hrActive = S.hueRotate !== 0;
+  const hrCos = Math.cos(S.hueRotate), hrSin = Math.sin(S.hueRotate);
+
   const col = [0, 0, 0];
   let idx = 0, flagIdx = 0;
   for (let py = 0; py < ih; py++) {
@@ -352,6 +645,7 @@ function renderFractal() {
         paletteColor(t, maxIter, col);
         insideFlags[flagIdx] = 0;
       }
+      if (hrActive) applyHueRotate(col, hrCos, hrSin);
       buf8[idx] = col[0]; buf8[idx + 1] = col[1]; buf8[idx + 2] = col[2]; buf8[idx + 3] = 255;
       idx += 4; flagIdx++;
     }
@@ -442,6 +736,7 @@ window.addEventListener('keydown', (e) => {
   keys[e.key.toLowerCase()] = true;
   if (e.key === 'p' || e.key === 'P' || e.key === 'Escape') togglePause();
   if ((e.key === 'Enter' || e.key === ' ') && S.mode === 'start') startGame();
+  if ((e.key === 'f' || e.key === 'F') && S.mode === 'playing') toggleFreeMode();
 });
 window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
 
@@ -518,6 +813,8 @@ function resetRun() {
   pickSeed(S.seedIndex);
   particles.length = 0;
   reefNum.textContent = '1';
+  S.freeMode = false;
+  freeModeBadge.classList.add('hidden');
 }
 
 function startGame() {
@@ -540,6 +837,12 @@ function togglePause() {
   }
 }
 
+function toggleFreeMode() {
+  S.freeMode = !S.freeMode;
+  freeModeBadge.classList.toggle('hidden', !S.freeMode);
+  sfxMilestone();
+}
+
 function formatDepth(logZoom) {
   return '10^' + logZoom.toFixed(1) + '×';
 }
@@ -547,6 +850,89 @@ function formatDepth(logZoom) {
 startBtn.addEventListener('click', startGame);
 resumeBtn.addEventListener('click', togglePause);
 restartBtn.addEventListener('click', startGame);
+
+// ============================================================
+// Render quality (manual override of the adaptive system)
+// ============================================================
+
+const qualityCaptions = {
+  auto: 'Automatically balances resolution for a smooth framerate.',
+  low: 'Lowest resolution — blockier, but fastest on weak devices.',
+  medium: 'Balanced resolution and performance.',
+  high: 'Sharper detail — needs a reasonably fast device.',
+  ultra: 'Maximum resolution — may drop frames on weaker devices.',
+  gpu: 'GPU-accelerated — full display resolution, computed on your graphics card. Hands back to CPU rendering past very deep zoom.',
+};
+
+function updateQualityUI() {
+  document.querySelectorAll('.qbtn[data-quality]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.quality === S.qualityMode);
+  });
+  document.querySelectorAll('[data-quality-caption]').forEach((caption) => {
+    caption.textContent = qualityCaptions[S.qualityMode] || '';
+  });
+}
+
+const paletteCaptions = {
+  time: 'Color drifts slowly over time.',
+  depth: 'Hue continuously slides with zoom depth, cycling through the spectrum as you dive.',
+};
+
+function updatePaletteUI() {
+  document.querySelectorAll('.qbtn[data-palette]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.palette === S.paletteMode);
+  });
+  document.querySelectorAll('[data-palette-caption]').forEach((caption) => {
+    caption.textContent = paletteCaptions[S.paletteMode] || '';
+  });
+}
+
+function setPaletteMode(mode) {
+  if (mode !== 'time' && mode !== 'depth') return;
+  S.paletteMode = mode;
+  localStorage.setItem('mandelsurf_palette', mode);
+  updatePaletteUI();
+}
+
+function updateGPUStatusUI() {
+  document.querySelectorAll('[data-gpu-btn]').forEach((btn) => {
+    btn.disabled = !glSupported;
+  });
+  document.querySelectorAll('[data-gpu-status]').forEach((el) => {
+    el.classList.toggle('unsupported', !glSupported);
+    el.textContent = glSupported
+      ? (glRendererName ? 'GPU detected: ' + glRendererName : 'GPU acceleration available (WebGL)')
+      : 'GPU acceleration unavailable — your browser/device has no WebGL. (This is a browser-standard, vendor-neutral API; CUDA/NVIDIA-specific libraries aren\'t reachable from a web page.)';
+  });
+}
+
+function setQualityMode(mode) {
+  if (mode === 'gpu' && !glSupported) mode = 'auto';
+  if (mode !== 'auto' && mode !== 'gpu' && !(mode in CFG.qualityPresets)) return;
+  S.qualityMode = mode;
+  localStorage.setItem('mandelsurf_quality', mode);
+  if (mode === 'gpu') {
+    // the CPU buffer only needs to drive gameplay logic now, not the
+    // visible picture, so a modest fixed resolution is plenty
+    S.quality = CFG.qualityPresets.medium;
+    recomputeInternalRes(window.innerWidth / window.innerHeight);
+  } else if (mode !== 'auto') {
+    S.quality = CFG.qualityPresets[mode];
+    recomputeInternalRes(window.innerWidth / window.innerHeight);
+  }
+  updateQualityUI();
+}
+
+qualityButtons.forEach((btn) => {
+  btn.addEventListener('click', () => setQualityMode(btn.dataset.quality));
+});
+paletteButtons.forEach((btn) => {
+  btn.addEventListener('click', () => setPaletteMode(btn.dataset.palette));
+});
+
+updateGPUStatusUI();
+setQualityMode(localStorage.getItem('mandelsurf_quality') || 'auto');
+setPaletteMode(localStorage.getItem('mandelsurf_palette') || 'time');
 
 // ============================================================
 // Update
@@ -711,8 +1097,9 @@ function update(dt) {
 
   const hasSignal = updateHeadingTangent(dt);
 
-  if (!hasSignal) {
-    // lost: free 2D movement, always immediately responsive
+  if (!hasSignal || S.freeMode) {
+    // lost, or the player explicitly disabled rim-snapping (free-fly): free
+    // 2D movement, always immediately responsive
     if (inputLen > 0.02) {
       const dirX = S.steerOffset / inputLen, dirY = S.steerOffsetY / inputLen;
       const mv = CFG.cameraSpeed * Math.min(1, inputLen) * boostMul * viewSpan * dt;
@@ -805,7 +1192,13 @@ function update(dt) {
 
   if (Math.random() < dt * 14) spawnWake(playerScreenX, playerScreenY);
 
-  S.hueShift += dt * 0.01;
+  S.hueShift += dt * CFG.hueTimeRate;
+  if (S.paletteMode === 'depth') {
+    const cyclePos = ((logZoom / CFG.hueRotateDecadesPerCycle) % 1 + 1) % 1;
+    S.hueRotate = cyclePos * Math.PI * 2;
+  } else {
+    S.hueRotate = 0;
+  }
 
   updateParticles(dt);
 }
@@ -815,6 +1208,7 @@ function update(dt) {
 // ============================================================
 
 function adaptQuality(frameMs) {
+  if (S.qualityMode !== 'auto') return; // manual preset - leave the player's choice alone
   S.perfCheckTimer -= 1;
   if (S.perfCheckTimer > 0) return;
   S.perfCheckTimer = 30;
@@ -1043,9 +1437,17 @@ function frame(now) {
   update(dt);
 
   if (S.mode === 'playing' || S.mode === 'transition') {
-    renderFractal();
+    renderFractal(); // gameplay logic (rim, movement, collision) always runs on this CPU buffer
     computeRimField();
   }
+
+  const useGPU = S.qualityMode === 'gpu' && glSupported &&
+    S.zoomFactor <= CFG.gpuMaxSafeZoom &&
+    (S.mode === 'playing' || S.mode === 'transition' || S.mode === 'paused');
+  fractalGLCanvas.style.display = useGPU ? 'block' : 'none';
+  fractalCanvas.style.display = useGPU ? 'none' : 'block';
+  if (useGPU) renderFractalGPU();
+
   render();
 
   const frameMs = performance.now() - t0;

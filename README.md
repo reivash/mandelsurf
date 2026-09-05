@@ -6,7 +6,7 @@ keeps your board glued to it while the camera dives in forever — steer along
 the edge for score, or peel out to open water to catch your breath. There's
 no way to lose; it's just an endless dive.
 
-![Gameplay preview](screenshots/gameplay-preview.gif)
+<img src="screenshots/gameplay-preview.gif" width="100%" alt="Gameplay preview">
 
 ([full clip with sound](screenshots/gameplay.mp4) — GitHub doesn't play embedded video in READMEs, so this is a GIF preview; click through for the real thing)
 

@@ -8,11 +8,11 @@ no way to lose; it's just an endless dive.
 
 <img src="screenshots/gameplay-preview.gif" width="100%" alt="Gameplay preview">
 
-([full clip with sound](screenshots/gameplay.mp4) — GitHub doesn't play embedded video in READMEs, so this is a GIF preview; click through for the real thing)
-
 ![Riding the coastline of a mini-brot](screenshots/gameplay-1.jpg)
 
 ![Deeper into a satellite filament](screenshots/gameplay-2.jpg)
+
+![The menu — GPU rendering and depth-shift palette selected](screenshots/menu.jpg)
 
 Pure HTML/CSS/JS, no build step, no dependencies.
 

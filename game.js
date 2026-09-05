@@ -15,30 +15,16 @@ const hud = document.getElementById('hud');
 const scoreVal = document.getElementById('scoreVal');
 const depthVal = document.getElementById('depthVal');
 const bestVal = document.getElementById('bestVal');
-const healthFill = document.getElementById('healthFill');
 const boostFill = document.getElementById('boostFill');
 const reefBadge = document.getElementById('reefBadge');
 const reefNum = document.getElementById('reefNum');
 
 const startScreen = document.getElementById('startScreen');
 const pauseScreen = document.getElementById('pauseScreen');
-const gameOverScreen = document.getElementById('gameOverScreen');
 const startBtn = document.getElementById('startBtn');
 const resumeBtn = document.getElementById('resumeBtn');
-const retryBtn = document.getElementById('retryBtn');
+const restartBtn = document.getElementById('restartBtn');
 
-const finalScore = document.getElementById('finalScore');
-const finalBest = document.getElementById('finalBest');
-const finalDepth = document.getElementById('finalDepth');
-const finalReefs = document.getElementById('finalReefs');
-
-const touchControls = document.getElementById('touchControls');
-const btnLeft = document.getElementById('btnLeft');
-const btnRight = document.getElementById('btnRight');
-const btnBoost = document.getElementById('btnBoost');
-
-const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
-if (isTouch) touchControls.classList.remove('hidden');
 
 // ============================================================
 // Audio (tiny synth, no assets)
@@ -69,11 +55,6 @@ function beep(freq, dur, type, gain, glide) {
   osc.stop(t0 + dur + 0.02);
 }
 
-function sfxWipeout() {
-  if (!actx) return;
-  beep(160, 0.45, 'sawtooth', 0.2, 0.25);
-  beep(90, 0.55, 'square', 0.12, 0.4);
-}
 function sfxPortal() {
   if (!actx) return;
   beep(420, 0.5, 'sine', 0.12, 3.2);
@@ -133,20 +114,33 @@ const CFG = {
   zoomRateCap: 1.55,
   resetZoomFactor: 4e11,    // precision safety threshold
   span: 3.2,
+  initialZoomFactor: 14,    // start already at a coastline-scale view, not the whole set
+
+  // steering: player's screen-space position, left/right
   steerAccel: 3.6,
   steerFriction: 5.2,
   steerMax: 0.9,
-  playerRowFrac: 0.76,
-  healthMax: 100,
-  damageInsideRate: 95,
-  damageFoamRate: 10,
-  healRate: 26,
-  foamIterRatio: 0.86,
+  playerRowFrac: 0.74,        // screen anchor row for the board sprite
+
+  // movement: the view never rotates, only translates (pans) and zooms.
+  gradEpsPixels: 5,          // finite-difference sampling radius, in internal px
+  rimSmoothPixels: 8,        // rim-line blur radius, in internal px; a fixed fraction of the
+                             // screen, so deeper zoom naturally reveals finer coastline detail
+  rimFineSmoothPixels: 2,    // second, lighter blur radius that still resolves thin filaments
+  rimFineGate: 0.15,         // only trust the fine pass where the main blur reads this empty or less
+  cameraSpeed: 1.4,          // direct player-steered movement speed, screen-widths/sec
+  rimSnapRate: 18,           // 1/time-constant for the perpendicular-only snap onto the nearest rim point (firm, near-instant)
+  minGradMag: 0.015,         // below this the local field reads as flat (no coastline signal)
+  turnResponsiveness: 5,     // 1/time-constant for heading smoothing
+  lostTimeout: 1,            // seconds with no gradient signal before the zoom reverses to escape empty space
+  driftSpeed: 0.16,          // idle auto-glide speed (no input held), screen-widths/sec
+  driftSpeedBoostMul: 1.9,
+
+  foamIterRatio: 0.86,       // cosmetic only: iteration ratio used for the glowing edge highlight in the palette
+  foamDistFrac: 0.1,         // gameplay: distance-to-boundary (screen-widths) under which the player is "in the foam"
   boostDrainRate: 42,
   boostRegenRate: 16,
   boostMinToStart: 6,
-  driftIntervalMin: 0.35,
-  driftIntervalMax: 0.6,
 };
 
 // ============================================================
@@ -154,40 +148,39 @@ const CFG = {
 // ============================================================
 
 const S = {
-  mode: 'start', // start | playing | paused | gameover | transition
+  mode: 'start', // start | playing | paused | transition
   time: 0,
   dt: 0,
   cx: 0, cy: 0,
+  seedCx: 0, seedCy: 0, // anchor the drift is forced back toward if it ever loses the coastline
+  heading: 0,       // camera drift direction, radians, in plane space (translation only)
+  lostTime: 0,      // seconds since the camera last had a coastline gradient signal
   zoomFactor: 1,
   zoomRate: CFG.zoomRateStart,
-  driftTarget: { x: 0, y: 0 },
-  driftTimer: 0,
-  driftDirBiasX: 0,
-  driftDirBiasY: 0,
-  steerOffset: 0,   // -1..1 fraction
+  steerOffset: 0,   // -1..1 fraction, lateral aim
   steerVel: 0,
+  steerOffsetY: 0,  // -1..1 fraction, vertical aim
+  steerVelY: 0,
   inputDir: 0,      // keyboard held direction
   pointerActive: false,
   pointerFrac: 0,
-  health: CFG.healthMax,
+  pointerFracY: 0,
   boost: 100,
   boosting: false,
   score: 0,
   best: Number(localStorage.getItem('mandelsurf_best') || 0),
+  bestSaveTimer: 0,
   reefCount: 1,
   maxDepthReached: 0,
   quality: 0.85,
   seedIndex: 0,
   transitionT: 0,
   transitionDur: 1.1,
-  shake: 0,
   flash: 0,
   playerInside: false,
   playerFoam: false,
   lastFrameMs: 16,
   perfCheckTimer: 0,
-  wipeoutT: 0,
-  wipeoutActive: false,
   hueShift: 0,
 };
 
@@ -197,13 +190,15 @@ bestVal.textContent = Math.floor(S.best).toLocaleString();
 let iw = 200, ih = 320;
 let imageData = null;
 let buf8 = null;
+let insideFlags = null; // Uint8Array, 1 per pixel: 1 = inside the set, 0 = escapes
+let blurTmp = null, blurOut = null; // Float32Array scratch buffers for the main smoothed rim
+let fineTmp = null, fineOut = null; // ...and a lightly-smoothed pass that still resolves thin filaments
 
 // fx canvas real pixel size
 let fxW = 0, fxH = 0, dpr = 1;
 
 // particles: {x,y,vx,vy,life,maxLife,size,r,g,b,kind}
 let particles = [];
-let trail = []; // recent player screen positions for foam trail
 
 // ============================================================
 // Resize
@@ -232,6 +227,11 @@ function recomputeInternalRes(aspect) {
   fractalCanvas.height = ih;
   imageData = fctx.createImageData(iw, ih);
   buf8 = imageData.data;
+  insideFlags = new Uint8Array(iw * ih);
+  blurTmp = new Float32Array(iw * ih);
+  blurOut = new Float32Array(iw * ih);
+  fineTmp = new Float32Array(iw * ih);
+  fineOut = new Float32Array(iw * ih);
 }
 
 window.addEventListener('resize', resize);
@@ -256,6 +256,30 @@ function sampleIter(x0, y0, maxIter) {
   let smooth = iter + 1 - nu;
   if (smooth < 0) smooth = 0;
   return smooth;
+}
+
+// Distance estimate to the set boundary, in plane units. Iteration count is
+// wildly nonlinear near the edge (it diverges as you approach it), which
+// makes it useless as a "how close to the rock" gameplay signal - the
+// standard fix is to track the derivative alongside z and use the classic
+// exterior distance estimator, which behaves close to a real Euclidean
+// distance and is what makes gradual "near the edge" queries possible at all.
+function sampleDist(x0, y0, maxIter) {
+  let x = 0, y = 0, x2 = 0, y2 = 0, iter = 0;
+  let dx = 0, dy = 0;
+  while (x2 + y2 <= 4 && iter < maxIter) {
+    const ndx = 2 * (x * dx - y * dy) + 1;
+    const ndy = 2 * (x * dy + y * dx);
+    dx = ndx; dy = ndy;
+    y = 2 * x * y + y0;
+    x = x2 - y2 + x0;
+    x2 = x * x; y2 = y * y;
+    iter++;
+  }
+  if (iter >= maxIter) return { inside: true, de: 0 };
+  const zmag = Math.sqrt(x2 + y2);
+  const dmag = Math.hypot(dx, dy) || 1e-9;
+  return { inside: false, de: zmag * Math.log(zmag) / dmag };
 }
 
 // palette: cosine-based ocean gradient. t in [0, ~40], cyclic.
@@ -315,7 +339,7 @@ function renderFractal() {
   cachedMaxIter = maxIter;
 
   const col = [0, 0, 0];
-  let idx = 0;
+  let idx = 0, flagIdx = 0;
   for (let py = 0; py < ih; py++) {
     const y0 = cy + (py - halfH) * scale;
     for (let px = 0; px < iw; px++) {
@@ -323,65 +347,89 @@ function renderFractal() {
       const t = sampleIter(x0, y0, maxIter);
       if (t >= maxIter) {
         rockColor(px, py, col);
+        insideFlags[flagIdx] = 1;
       } else {
         paletteColor(t, maxIter, col);
+        insideFlags[flagIdx] = 0;
       }
       buf8[idx] = col[0]; buf8[idx + 1] = col[1]; buf8[idx + 2] = col[2]; buf8[idx + 3] = 255;
-      idx += 4;
+      idx += 4; flagIdx++;
     }
   }
   fctx.putImageData(imageData, 0, 0);
 }
 
 function sampleAt(fracX, fracY) {
-  // fracX,fracY in screen-space [0,1]; returns {inside, ratio}
+  // fracX,fracY in screen-space [0,1]; returns {inside, distFrac} where
+  // distFrac is the distance to the boundary as a fraction of the current
+  // view width (scale-invariant, and roughly linear near the edge - unlike
+  // raw iteration count).
   const scale = CFG.span / (S.zoomFactor * iw);
   const halfW = iw / 2, halfH = ih / 2;
   const px = fracX * iw, py = fracY * ih;
   const x0 = S.cx + (px - halfW) * scale;
   const y0 = S.cy + (py - halfH) * scale;
-  const t = sampleIter(x0, y0, cachedMaxIter);
-  return { inside: t >= cachedMaxIter, ratio: t / cachedMaxIter };
-}
-
-function planeAt(fracX, fracY) {
-  const scale = CFG.span / (S.zoomFactor * iw);
-  const halfW = iw / 2, halfH = ih / 2;
-  const px = fracX * iw, py = fracY * ih;
-  return { x: S.cx + (px - halfW) * scale, y: S.cy + (py - halfH) * scale };
+  const r = sampleDist(x0, y0, cachedMaxIter);
+  return { inside: r.inside, distFrac: r.inside ? 0 : r.de / (scale * iw) };
 }
 
 function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
 
 // ============================================================
-// Drift (auto boundary-seeking camera)
+// Drift: the camera hugs the coastline (translation only, the view
+// never rotates). Every frame we read the local gradient of the
+// escape-time field (it points "into" the set) and use it two ways:
+// its perpendicular is the coastline's tangent, which the camera
+// glides along; its own direction pulls the camera back toward a
+// fixed target ride-line if it strays. If the local area is flat
+// (no gradient at all — open water far from any coastline, or
+// buried in solid interior) that pull can't work, so a separate
+// timer forces the camera to steer straight back toward the run's
+// seed point after a short timeout, guaranteeing it can never
+// wander out of range of the fractal for long.
 // ============================================================
 
-function updateDrift(dt) {
-  S.driftTimer -= dt;
-  if (S.driftTimer <= 0) {
-    S.driftTimer = CFG.driftIntervalMin + Math.random() * (CFG.driftIntervalMax - CFG.driftIntervalMin);
-    const scale = CFG.span / (S.zoomFactor * iw);
-    const radius = scale * iw * 0.16;
-    let bestScore = -1, bestX = S.cx, bestY = S.cy;
-    const angles = 10;
-    for (let i = 0; i < angles; i++) {
-      const a = (i / angles) * Math.PI * 2 + S.time * 0.15;
-      const cx2 = S.cx + Math.cos(a) * radius;
-      const cy2 = S.cy + Math.sin(a) * radius;
-      const t = sampleIter(cx2, cy2, Math.min(140, cachedMaxIter));
-      if (t < Math.min(140, cachedMaxIter)) {
-        const score = t + hash2(i, Math.floor(S.time * 10)) * 4;
-        if (score > bestScore) { bestScore = score; bestX = cx2; bestY = cy2; }
-      }
-    }
-    // blend with momentum for smoother path
-    S.driftTarget.x = S.driftTarget.x * 0.55 + bestX * 0.45;
-    S.driftTarget.y = S.driftTarget.y * 0.55 + bestY * 0.45;
+function computeGradient(px, py, eps, maxIter) {
+  const a = sampleIter(px + eps, py, maxIter);
+  const b = sampleIter(px - eps, py, maxIter);
+  const c = sampleIter(px, py + eps, maxIter);
+  const d = sampleIter(px, py - eps, maxIter);
+  const gx = (a - b) / (2 * eps);
+  const gy = (c - d) / (2 * eps);
+  return { gx, gy, mag: Math.hypot(gx, gy) };
+}
+
+// Tracks a "which way does the coastline run here" heading via gradient
+// tangent-following. This no longer moves the camera itself (see update()
+// for why) - it only maintains S.heading, used as the reference axis for
+// tangent-constrained movement and the rim-snap's perpendicular correction,
+// and only while real coastline signal actually exists nearby. Returns
+// whether it found one this frame; update() uses that to decide whether
+// movement should be tangent-constrained (near real coastline) or free
+// (lost - see the comment in update() for why forcing a single heading
+// there was actively harmful).
+function updateHeadingTangent(dt) {
+  const scale = CFG.span / (S.zoomFactor * iw);
+  const eps = scale * CFG.gradEpsPixels;
+  const rowY = S.cy + (CFG.playerRowFrac - 0.5) * ih * scale;
+  const grad = computeGradient(S.cx, rowY, eps, cachedMaxIter);
+  const hasSignal = grad.mag > CFG.minGradMag;
+
+  if (hasSignal) {
+    S.lostTime = 0;
+    let tx = -grad.gy, ty = grad.gx;
+    const tmag = Math.hypot(tx, ty) || 1;
+    tx /= tmag; ty /= tmag;
+    const hx = Math.cos(S.heading), hy = Math.sin(S.heading);
+    if (tx * hx + ty * hy < 0) { tx = -tx; ty = -ty; }
+    const turnLerp = 1 - Math.exp(-CFG.turnResponsiveness * dt);
+    const ndx = hx + (tx - hx) * turnLerp;
+    const ndy = hy + (ty - hy) * turnLerp;
+    S.heading = Math.atan2(ndy, ndx);
+  } else {
+    S.lostTime += dt;
   }
-  const followSpeed = 0.9;
-  S.cx += (S.driftTarget.x - S.cx) * Math.min(1, followSpeed * dt);
-  S.cy += (S.driftTarget.y - S.cy) * Math.min(1, followSpeed * dt);
+  return hasSignal;
 }
 
 // ============================================================
@@ -394,7 +442,6 @@ window.addEventListener('keydown', (e) => {
   keys[e.key.toLowerCase()] = true;
   if (e.key === 'p' || e.key === 'P' || e.key === 'Escape') togglePause();
   if ((e.key === 'Enter' || e.key === ' ') && S.mode === 'start') startGame();
-  if ((e.key === 'Enter' || e.key === ' ') && S.mode === 'gameover') startGame();
 });
 window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
 
@@ -402,6 +449,12 @@ function readInputDir() {
   let d = 0;
   if (keys['arrowleft'] || keys['a']) d -= 1;
   if (keys['arrowright'] || keys['d']) d += 1;
+  return d;
+}
+function readInputDirY() {
+  let d = 0;
+  if (keys['arrowup'] || keys['w']) d -= 1;
+  if (keys['arrowdown'] || keys['s']) d += 1;
   return d;
 }
 function readBoostHeld() {
@@ -427,24 +480,14 @@ function onPointerUp(e) {
 }
 function updatePointerFrac(e) {
   const x = e.clientX / window.innerWidth;
+  const y = e.clientY / window.innerHeight;
   S.pointerFrac = clamp((x - 0.5) * 2.2, -1, 1);
+  S.pointerFracY = clamp((y - CFG.playerRowFrac) * 2.2, -1, 1);
 }
 stage.addEventListener('pointerdown', onPointerDown);
 stage.addEventListener('pointermove', onPointerMove);
 window.addEventListener('pointerup', onPointerUp);
 window.addEventListener('pointercancel', onPointerUp);
-
-// touch buttons
-function bindHold(el, onDown, onUp) {
-  el.addEventListener('pointerdown', (e) => { e.preventDefault(); onDown(); });
-  el.addEventListener('pointerup', (e) => { e.preventDefault(); onUp(); });
-  el.addEventListener('pointerleave', (e) => { onUp(); });
-  el.addEventListener('pointercancel', (e) => { onUp(); });
-}
-let touchLeft = false, touchRight = false, touchBoost = false;
-bindHold(btnLeft, () => touchLeft = true, () => touchLeft = false);
-bindHold(btnRight, () => touchRight = true, () => touchRight = false);
-bindHold(btnBoost, () => touchBoost = true, () => touchBoost = false);
 
 // ============================================================
 // Game flow
@@ -453,25 +496,27 @@ bindHold(btnBoost, () => touchBoost = true, () => touchBoost = false);
 function pickSeed(index) {
   const s = SEEDS[index % SEEDS.length];
   S.cx = s.cx; S.cy = s.cy;
-  S.driftTarget.x = s.cx; S.driftTarget.y = s.cy;
+  S.seedCx = s.cx; S.seedCy = s.cy;
+  S.heading = Math.random() * Math.PI * 2;
+  S.lostTime = 0;
 }
 
 function resetRun() {
-  S.zoomFactor = 1;
+  S.zoomFactor = CFG.initialZoomFactor;
   S.zoomRate = CFG.zoomRateStart;
   S.score = 0;
-  S.health = CFG.healthMax;
   S.boost = 100;
   S.boosting = false;
   S.reefCount = 1;
   S.maxDepthReached = 0;
   S.steerOffset = 0;
   S.steerVel = 0;
+  S.steerOffsetY = 0;
+  S.steerVelY = 0;
   S.time = 0;
   S.seedIndex = Math.floor(Math.random() * SEEDS.length);
   pickSeed(S.seedIndex);
   particles.length = 0;
-  trail.length = 0;
   reefNum.textContent = '1';
 }
 
@@ -480,7 +525,6 @@ function startGame() {
   resetRun();
   S.mode = 'playing';
   startScreen.classList.add('hidden');
-  gameOverScreen.classList.add('hidden');
   pauseScreen.classList.add('hidden');
   hud.classList.remove('hidden');
 }
@@ -488,26 +532,12 @@ function startGame() {
 function togglePause() {
   if (S.mode === 'playing') {
     S.mode = 'paused';
+    localStorage.setItem('mandelsurf_best', String(Math.floor(S.best)));
     pauseScreen.classList.remove('hidden');
   } else if (S.mode === 'paused') {
     S.mode = 'playing';
     pauseScreen.classList.add('hidden');
   }
-}
-
-function triggerWipeout() {
-  S.mode = 'gameover';
-  sfxWipeout();
-  boostAudioStop();
-  S.best = Math.max(S.best, S.score);
-  localStorage.setItem('mandelsurf_best', String(Math.floor(S.best)));
-  finalScore.textContent = Math.floor(S.score).toLocaleString();
-  finalBest.textContent = Math.floor(S.best).toLocaleString();
-  finalDepth.textContent = formatDepth(S.maxDepthReached);
-  finalReefs.textContent = String(S.reefCount);
-  bestVal.textContent = Math.floor(S.best).toLocaleString();
-  gameOverScreen.classList.remove('hidden');
-  hud.classList.add('hidden');
 }
 
 function formatDepth(logZoom) {
@@ -516,7 +546,7 @@ function formatDepth(logZoom) {
 
 startBtn.addEventListener('click', startGame);
 resumeBtn.addEventListener('click', togglePause);
-retryBtn.addEventListener('click', startGame);
+restartBtn.addEventListener('click', startGame);
 
 // ============================================================
 // Update
@@ -535,6 +565,18 @@ function spawnSplash(x, y, n, hueWarm) {
       r: hueWarm ? 255 : 210, g: hueWarm ? 160 : 240, b: hueWarm ? 90 : 255,
     });
   }
+}
+
+function spawnWake(x, y) {
+  particles.push({
+    x: x + (Math.random() - 0.5) * 14,
+    y: y + 14 + Math.random() * 6,
+    vx: (Math.random() - 0.5) * 24,
+    vy: 40 + Math.random() * 30,
+    life: 0, maxLife: 0.35 + Math.random() * 0.25,
+    size: 1.5 + Math.random() * 2,
+    r: 220, g: 245, b: 255,
+  });
 }
 
 function updateParticles(dt) {
@@ -556,7 +598,7 @@ function update(dt) {
     S.transitionT += dt;
     S.flash = Math.max(0, 1 - Math.abs(S.transitionT - S.transitionDur * 0.5) / (S.transitionDur * 0.5));
     if (S.transitionT >= S.transitionDur) {
-      S.zoomFactor = 1;
+      S.zoomFactor = CFG.initialZoomFactor;
       S.reefCount++;
       S.seedIndex = (S.seedIndex + 1 + Math.floor(Math.random() * (SEEDS.length - 1))) % SEEDS.length;
       pickSeed(S.seedIndex);
@@ -576,20 +618,29 @@ function update(dt) {
   if (S.mode !== 'playing') return;
 
   // --- input ---
-  const dir = readInputDir() || (touchLeft ? -1 : touchRight ? 1 : 0);
-  const boostHeld = readBoostHeld() || touchBoost;
+  const dir = readInputDir();
+  const dirY = readInputDirY();
+  const boostHeld = readBoostHeld();
 
   if (S.pointerActive) {
     const desired = S.pointerFrac;
     S.steerVel += (desired - S.steerOffset) * 14 * dt;
     S.steerVel *= Math.max(0, 1 - 6 * dt);
+    const desiredY = S.pointerFracY;
+    S.steerVelY += (desiredY - S.steerOffsetY) * 14 * dt;
+    S.steerVelY *= Math.max(0, 1 - 6 * dt);
   } else {
     S.steerVel += dir * CFG.steerAccel * dt;
     S.steerVel *= Math.max(0, 1 - CFG.steerFriction * dt);
+    S.steerVelY += dirY * CFG.steerAccel * dt;
+    S.steerVelY *= Math.max(0, 1 - CFG.steerFriction * dt);
   }
   S.steerOffset += S.steerVel * dt;
   if (S.steerOffset > CFG.steerMax) { S.steerOffset = CFG.steerMax; S.steerVel = 0; }
   if (S.steerOffset < -CFG.steerMax) { S.steerOffset = -CFG.steerMax; S.steerVel = 0; }
+  S.steerOffsetY += S.steerVelY * dt;
+  if (S.steerOffsetY > CFG.steerMax) { S.steerOffsetY = CFG.steerMax; S.steerVelY = 0; }
+  if (S.steerOffsetY < -CFG.steerMax) { S.steerOffsetY = -CFG.steerMax; S.steerVelY = 0; }
 
   // --- boost ---
   const canBoost = boostHeld && S.boost > CFG.boostMinToStart;
@@ -605,7 +656,15 @@ function update(dt) {
   // --- zoom ---
   S.zoomRate = Math.min(CFG.zoomRateCap, S.zoomRate + CFG.zoomRateGrowthPerSec * dt);
   const effRate = S.boosting ? Math.pow(S.zoomRate, CFG.zoomRateBoostMul) : S.zoomRate;
-  S.zoomFactor *= Math.pow(effRate, dt);
+  if (S.lostTime > CFG.lostTimeout) {
+    // drifted somewhere with no coastline anywhere in view - zooming in
+    // further only makes empty space emptier, so reverse until the
+    // coastline (and the seed-point homing already steering back toward
+    // it) brings something back into view.
+    S.zoomFactor = Math.max(1, S.zoomFactor / Math.pow(effRate, dt));
+  } else {
+    S.zoomFactor *= Math.pow(effRate, dt);
+  }
   const logZoom = Math.log10(S.zoomFactor);
   S.maxDepthReached = Math.max(S.maxDepthReached, logZoom);
   depthVal.textContent = formatDepth(logZoom);
@@ -619,52 +678,136 @@ function update(dt) {
     return;
   }
 
-  // --- drift camera ---
-  updateDrift(dt);
+  // --- move the camera (== the board's world position, since the board is
+  // always drawn at a fixed screen anchor). Two different modes, chosen by
+  // whether there's real coastline signal right where the board is:
+  //
+  // - Near real coastline: movement is constrained to its local tangent -
+  //   steering only picks which way along it (by how much your input
+  //   direction agrees with the tangent), rather than flying freely. Free
+  //   movement here was tried and rejected: pushed straight, it happily
+  //   carries you off into open water or deep into rock, and nothing can
+  //   snap you back once the coastline isn't even in view. Tangent motion
+  //   can't leave the rim in the first place, by construction, and (since
+  //   the tangent is a *smoothed* heading, not a raw per-frame lookup) it
+  //   doesn't reintroduce the older "chasing a fresh dot every frame" bug.
+  //
+  // - Lost (no coastline signal nearby): tangent-following has nothing real
+  //   to follow, so it was falling back to a single fixed "head toward
+  //   home" direction - and your 2D input only ever controlled how much of
+  //   *that* direction to use. If home happened to be roughly perpendicular
+  //   to the way you were pushing, your input did almost nothing, which is
+  //   exactly the "I can't push right" bug. So instead: while lost,
+  //   movement is fully free and directly player-controlled (immediately
+  //   responsive to whichever way you push), which is exactly what you need
+  //   to actively steer back toward any visible structure. Combined with
+  //   the zoom-out-while-lost behavior above, this reliably finds the
+  //   coastline again rather than digging deeper into empty space.
+  const scale = CFG.span / (S.zoomFactor * iw);
+  const halfW = iw / 2, halfH = ih / 2;
+  const viewSpan = scale * iw;
+  const boostMul = S.boosting ? CFG.driftSpeedBoostMul : 1;
+  const inputLen = Math.hypot(S.steerOffset, S.steerOffsetY);
 
-  // --- sample player ---
-  const playerFracX = 0.5 + S.steerOffset * 0.5;
-  const playerFracY = CFG.playerRowFrac;
-  const samp = sampleAt(clamp(playerFracX, 0.02, 0.98), playerFracY);
-  S.playerInside = samp.inside;
-  S.playerFoam = !samp.inside && samp.ratio > CFG.foamIterRatio;
+  const hasSignal = updateHeadingTangent(dt);
 
-  // --- health & score ---
-  let scoreRate = 12 + logZoom * 1.6;
-  if (S.playerInside) {
-    S.health -= CFG.damageInsideRate * dt;
-    S.shake = Math.min(1, S.shake + dt * 6);
-    if (Math.random() < dt * 18) {
-      spawnSplash(fxW / dpr * (0.5 + S.steerOffset * 0.5), fxH / dpr * playerFracY, 2, false);
-    }
-  } else if (S.playerFoam) {
-    S.health -= CFG.damageFoamRate * dt;
-    scoreRate *= 1.8;
-    S.shake = Math.max(0, S.shake - dt * 2);
-    if (Math.random() < dt * 10) {
-      spawnSplash(fxW / dpr * (0.5 + S.steerOffset * 0.5), fxH / dpr * playerFracY, 1, false);
+  if (!hasSignal) {
+    // lost: free 2D movement, always immediately responsive
+    if (inputLen > 0.02) {
+      const dirX = S.steerOffset / inputLen, dirY = S.steerOffsetY / inputLen;
+      const mv = CFG.cameraSpeed * Math.min(1, inputLen) * boostMul * viewSpan * dt;
+      S.cx += dirX * mv;
+      S.cy += dirY * mv;
+    } else {
+      // idle while lost: drift gently back toward the run's seed point,
+      // guaranteed to be on a coastline
+      const homeAngle = Math.atan2(S.seedCy - S.cy, S.seedCx - S.cx);
+      const mv = CFG.driftSpeed * boostMul * viewSpan * dt;
+      S.cx += Math.cos(homeAngle) * mv;
+      S.cy += Math.sin(homeAngle) * mv;
     }
   } else {
-    S.health = Math.min(CFG.healthMax, S.health + CFG.healRate * dt);
-    S.shake = Math.max(0, S.shake - dt * 2);
+    const hx = Math.cos(S.heading), hy = Math.sin(S.heading);
+    if (inputLen > 0.02) {
+      // how much of the requested direction agrees with the tangent - this
+      // is signed, so pushing "backward" along the rim actually reverses
+      const along = clamp((S.steerOffset * hx + S.steerOffsetY * hy) / inputLen, -1, 1) * Math.min(1, inputLen);
+      const mv = along * CFG.cameraSpeed * boostMul * viewSpan * dt;
+      S.cx += hx * mv;
+      S.cy += hy * mv;
+    } else {
+      // idle: glide forward along the coastline at a gentler, constant pace
+      const mv = CFG.driftSpeed * boostMul * viewSpan * dt;
+      S.cx += hx * mv;
+      S.cy += hy * mv;
+    }
+
+    // --- firm rim-snap: pulls the board onto the nearest actual rim point,
+    // applied *only* perpendicular to the current heading so it can never
+    // cancel or fight the forward motion above. That decomposition is what
+    // makes it safe to snap hard here: the earlier "stuck orbiting in
+    // curves" bug came from letting the nearest-point search drive movement
+    // *along* the direction of travel too, so a fresh, slightly-different
+    // nearest pixel every frame (as zoom reveals new rim detail) could tug
+    // you backward as easily as forward. With the along component entirely
+    // player-controlled and this one confined to the sideways axis, a fresh
+    // "new dot" each frame only ever adjusts how far sideways you are - it
+    // converges to hugging the line, it can't stall or reverse your travel.
+    // Only runs with real signal nearby, so it can't drag a lost board
+    // toward some distant, unrelated rim point either.
+    const nearest = findNearestRimPoint(0.5, CFG.playerRowFrac);
+    if (nearest) {
+      const targetPlaneX = S.cx + (nearest.x * iw - halfW) * scale;
+      const targetPlaneY = S.cy + (nearest.y * ih - halfH) * scale;
+      const desiredCy = targetPlaneY - (CFG.playerRowFrac - 0.5) * ih * scale;
+      const dx = targetPlaneX - S.cx, dy = desiredCy - S.cy;
+      const along2 = dx * hx + dy * hy;
+      const latX = dx - along2 * hx, latY = dy - along2 * hy;
+      const snapLerp = 1 - Math.exp(-CFG.rimSnapRate * dt);
+      S.cx += latX * snapLerp;
+      S.cy += latY * snapLerp;
+    }
+  }
+
+  const playerFracX = 0.5, playerFracY = CFG.playerRowFrac;
+  const samp = sampleAt(playerFracX, playerFracY);
+  S.playerInside = samp.inside;
+  S.playerFoam = !samp.inside && samp.distFrac < CFG.foamDistFrac;
+
+  const playerScreenX = fxW / dpr * playerFracX;
+  const playerScreenY = fxH / dpr * playerFracY;
+
+  // --- score (touching rock just skips the foam bonus, nothing else - no
+  // damage, no shake, no sfx - there is no way to lose in this game) ---
+  let scoreRate = 12 + logZoom * 1.6;
+  if (S.playerInside) {
+    if (Math.random() < dt * 18) {
+      spawnSplash(playerScreenX, playerScreenY, 2, false);
+    }
+  } else if (S.playerFoam) {
+    scoreRate *= 1.8;
+    if (Math.random() < dt * 10) {
+      spawnSplash(playerScreenX, playerScreenY, 1, false);
+    }
   }
   if (S.boosting) scoreRate *= 1.5;
   S.score += scoreRate * dt;
   scoreVal.textContent = Math.floor(S.score).toLocaleString();
-
-  if (S.health <= 0) {
-    S.health = 0;
-    spawnSplash(fxW / dpr * (0.5 + S.steerOffset * 0.5), fxH / dpr * playerFracY, 55, false);
-    triggerWipeout();
+  if (S.score > S.best) {
+    S.best = S.score;
+    bestVal.textContent = Math.floor(S.best).toLocaleString();
+    S.bestSaveTimer -= dt;
+    if (S.bestSaveTimer <= 0) {
+      S.bestSaveTimer = 1;
+      localStorage.setItem('mandelsurf_best', String(Math.floor(S.best)));
+    }
   }
+
+  if (Math.random() < dt * 14) spawnWake(playerScreenX, playerScreenY);
 
   S.hueShift += dt * 0.01;
 
   updateParticles(dt);
-
-  // trail
-  trail.push({ x: 0.5 + S.steerOffset * 0.5, y: playerFracY, t: S.time });
-  while (trail.length && S.time - trail[0].t > 0.5) trail.shift();
 }
 
 // ============================================================
@@ -685,15 +828,14 @@ function adaptQuality(frameMs) {
 }
 
 // ============================================================
-// Render (fx layer: sprite, particles, vignette, shake)
+// Render (fx layer: sprite, particles)
 // ============================================================
 
-function drawSurfer(cx, cy, tilt, wipeout) {
+function drawSurfer(cx, cy, tilt) {
   const ctx = xctx;
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(tilt);
-  if (wipeout) ctx.rotate(S.time * 14);
 
   // board
   ctx.save();
@@ -732,6 +874,116 @@ function drawSurfer(cx, cy, tilt, wipeout) {
   ctx.restore();
 }
 
+// The raw pixel boundary is fractal-detailed at every zoom level - infinitely
+// jagged no matter how far in you go, which reads as noise rather than a
+// surfable line. So instead of tracing insideFlags directly, we box-blur it
+// first (a cheap two-pass sliding-window average) and trace the edge of
+// *that* - a low-pass-filtered "how solid is the rock around here" field
+// whose 50% contour follows the coastline's overall shape without every
+// filament-level wiggle.
+function boxBlurH(src, dst, w, h, r) {
+  for (let y = 0; y < h; y++) {
+    const base = y * w;
+    let sum = 0;
+    for (let k = -r; k <= r; k++) sum += src[base + clamp(k, 0, w - 1)];
+    for (let x = 0; x < w; x++) {
+      dst[base + x] = sum;
+      sum += src[base + clamp(x + r + 1, 0, w - 1)] - src[base + clamp(x - r, 0, w - 1)];
+    }
+  }
+}
+
+function boxBlurV(src, dst, w, h, r) {
+  for (let x = 0; x < w; x++) {
+    let sum = 0;
+    for (let k = -r; k <= r; k++) sum += src[clamp(k, 0, h - 1) * w + x];
+    for (let y = 0; y < h; y++) {
+      dst[y * w + x] = sum / ((2 * r + 1) * (2 * r + 1));
+      sum += src[clamp(y + r + 1, 0, h - 1) * w + x] - src[clamp(y - r, 0, h - 1) * w + x];
+    }
+  }
+}
+
+// Smooths insideFlags into blurOut (see boxBlurH/V above) and collects every
+// edge pixel of its 50% contour into rimPoints - flat [xFrac0,yFrac0,
+// xFrac1,yFrac1,...] in screen-space fractions. Computed once per frame and
+// shared by the rim visualization and the player's own rim-tracking.
+//
+// A single blur radius can't serve both goals at once: wide enough to smooth
+// a solid blob's jagged micro-edges into a rideable line, it also averages
+// any filament thinner than the radius down to a small minority of the
+// window - nowhere close to the 50% needed to register at all. That's not
+// just a cosmetic gap: the player can genuinely be riding real structure
+// (raw per-pixel data drives movement) that this line, at one blur scale,
+// would show as nothing. So we also run a second, much lighter blur, and
+// only trust it in spots the main pass calls empty - meaning it can only
+// ever add thin structure the big pass missed, never re-introduce the
+// jaggedness the big pass was built to smooth away.
+let rimPoints = [];
+function computeRimField() {
+  if (!insideFlags) return;
+  const r = CFG.rimSmoothPixels;
+  boxBlurH(insideFlags, blurTmp, iw, ih, r);
+  boxBlurV(blurTmp, blurOut, iw, ih, r);
+
+  const rf = CFG.rimFineSmoothPixels;
+  boxBlurH(insideFlags, fineTmp, iw, ih, rf);
+  boxBlurV(fineTmp, fineOut, iw, ih, rf);
+
+  rimPoints.length = 0;
+  for (let py = 0; py < ih - 1; py++) {
+    const rowBase = py * iw;
+    for (let px = 0; px < iw - 1; px++) {
+      const i = rowBase + px;
+      const here = blurOut[i] >= 0.5;
+      if ((blurOut[i + 1] >= 0.5) !== here || (blurOut[i + iw] >= 0.5) !== here) {
+        rimPoints.push(px / iw, py / ih);
+        continue;
+      }
+      // only look for filament-scale edges where the big blur found nothing
+      // nearby at all, so this can't double up on / roughen a real blob edge
+      if (blurOut[i] < CFG.rimFineGate && blurOut[i + 1] < CFG.rimFineGate && blurOut[i + iw] < CFG.rimFineGate) {
+        const fineHere = fineOut[i] >= 0.5;
+        if ((fineOut[i + 1] >= 0.5) !== fineHere || (fineOut[i + iw] >= 0.5) !== fineHere) {
+          rimPoints.push(px / iw, py / ih);
+        }
+      }
+    }
+  }
+}
+
+// Finds the closest point on the rim to a given screen-space fraction
+// (targetFracX, targetFracY), by direct nearest-neighbor scan over rimPoints.
+// This is the "gravity" that pulls the player back onto the line from
+// wherever they are, rather than requiring any particular row to line up.
+function findNearestRimPoint(targetFracX, targetFracY) {
+  if (rimPoints.length === 0) return null;
+  let bestD = Infinity, bestX = 0, bestY = 0;
+  for (let i = 0; i < rimPoints.length; i += 2) {
+    const dx = rimPoints[i] - targetFracX;
+    const dy = rimPoints[i + 1] - targetFracY;
+    const d = dx * dx + dy * dy;
+    if (d < bestD) { bestD = d; bestX = rimPoints[i]; bestY = rimPoints[i + 1]; }
+  }
+  return { x: bestX, y: bestY, dist: Math.sqrt(bestD) };
+}
+
+// Debug visualization: draw the smoothed boundary in red. This is meant to
+// validate "where the rim is" - it should look like a rideable coastline,
+// not the raw fractal edge, and the player sprite should sit right on it.
+function drawRim() {
+  const ctx = xctx;
+  const w = fxW / dpr, h = fxH / dpr;
+  const sx = w / iw, sy = h / ih;
+  const bw = Math.max(1, Math.ceil(sx)), bh = Math.max(1, Math.ceil(sy));
+  ctx.fillStyle = '#ff2222';
+  ctx.beginPath();
+  for (let i = 0; i < rimPoints.length; i += 2) {
+    ctx.rect(rimPoints[i] * iw * sx, rimPoints[i + 1] * ih * sy, bw, bh);
+  }
+  ctx.fill();
+}
+
 function render() {
   const ctx = xctx;
   const w = fxW / dpr, h = fxH / dpr;
@@ -739,30 +991,8 @@ function render() {
 
   if (S.mode === 'start') return;
 
-  let shakeX = 0, shakeY = 0;
-  if (S.shake > 0) {
-    shakeX = (Math.random() - 0.5) * 10 * S.shake;
-    shakeY = (Math.random() - 0.5) * 10 * S.shake;
-  }
-
-  ctx.save();
-  ctx.translate(shakeX, shakeY);
-
-  // foam trail
-  if (trail.length > 1) {
-    ctx.save();
-    ctx.lineCap = 'round';
-    for (let i = 1; i < trail.length; i++) {
-      const a = trail[i - 1], b = trail[i];
-      const age = (S.time - b.t) / 0.5;
-      ctx.strokeStyle = `rgba(220,250,255,${(1 - age) * 0.35})`;
-      ctx.lineWidth = 10 * (1 - age);
-      ctx.beginPath();
-      ctx.moveTo(a.x * w, a.y * h);
-      ctx.lineTo(b.x * w, b.y * h);
-      ctx.stroke();
-    }
-    ctx.restore();
+  if (S.mode === 'playing' || S.mode === 'paused' || S.mode === 'transition') {
+    drawRim();
   }
 
   // particles
@@ -776,28 +1006,13 @@ function render() {
   }
   ctx.globalAlpha = 1;
 
-  // surfer
+  // surfer: fixed screen anchor - the camera itself does the recentering,
+  // so it's the world that moves/zooms around the board, never the sprite
   if (S.mode === 'playing' || S.mode === 'paused') {
-    const px = w * (0.5 + S.steerOffset * 0.5);
+    const px = w * 0.5;
     const py = h * CFG.playerRowFrac;
     const tilt = clamp(S.steerVel * 0.5, -0.6, 0.6);
-    drawSurfer(px, py, tilt, false);
-  }
-
-  ctx.restore();
-
-  // danger vignette
-  if (S.mode === 'playing' && S.playerInside) {
-    ctx.fillStyle = 'rgba(180,20,10,0.18)';
-    ctx.fillRect(0, 0, w, h);
-  }
-
-  // low health pulse
-  if (S.mode === 'playing' && S.health < 25) {
-    const pulse = (Math.sin(S.time * 10) + 1) / 2;
-    ctx.strokeStyle = `rgba(255,60,40,${0.25 + pulse * 0.35})`;
-    ctx.lineWidth = 18;
-    ctx.strokeRect(9, 9, w - 18, h - 18);
+    drawSurfer(px, py, tilt);
   }
 
   // transition flash
@@ -808,9 +1023,6 @@ function render() {
 
   // HUD meters
   if (S.mode === 'playing' || S.mode === 'transition') {
-    const hp = clamp(S.health / CFG.healthMax, 0, 1);
-    healthFill.style.width = (hp * 100) + '%';
-    healthFill.className = 'meter-fill' + (hp < 0.3 ? ' low' : '');
     const bp = clamp(S.boost / 100, 0, 1);
     boostFill.style.width = (bp * 100) + '%';
     boostFill.className = 'meter-fill boost' + (S.boosting ? ' active' : '');
@@ -832,6 +1044,7 @@ function frame(now) {
 
   if (S.mode === 'playing' || S.mode === 'transition') {
     renderFractal();
+    computeRimField();
   }
   render();
 
@@ -841,16 +1054,23 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
+window.__DEBUG = S;
+window.__DEBUG_FN = { update, renderFractal, updateHeadingTangent, render, computeRimField, findNearestRimPoint };
+window.__DEBUG_CFG = CFG;
 
 // initial idle fractal preview behind the start screen
 S.mode = 'idle-preview';
+S.zoomFactor = CFG.initialZoomFactor;
 pickSeed(0);
-S.zoomFactor = 1;
 (function idlePreviewTick() {
   if (S.mode !== 'idle-preview') return;
   S.time += 1 / 30;
   S.zoomFactor *= Math.pow(1.05, 1 / 30);
-  updateDrift(1 / 30);
+  updateHeadingTangent(1 / 30);
+  const scale = CFG.span / (S.zoomFactor * iw);
+  const mv = CFG.driftSpeed * scale * iw * (1 / 30);
+  S.cx += Math.cos(S.heading) * mv;
+  S.cy += Math.sin(S.heading) * mv;
   renderFractal();
   setTimeout(idlePreviewTick, 1000 / 30);
 })();

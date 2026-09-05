@@ -28,12 +28,13 @@
       </div>
       <div class="hud-row hud-bottom">
         <div class="meter">
-          <div class="meter-label">BALANCE</div>
-          <div class="meter-track"><div class="meter-fill" id="healthFill"></div></div>
-        </div>
-        <div class="meter">
           <div class="meter-label">BOOST</div>
           <div class="meter-track"><div class="meter-fill boost" id="boostFill"></div></div>
+        </div>
+        <div class="legend">
+          <span class="key">WASD</span> / <span class="key">&larr;&uarr;&darr;&rarr;</span> steer
+          &nbsp;&nbsp;<span class="key">SHIFT</span>/<span class="key">SPACE</span> boost
+          &nbsp;&nbsp;<span class="key">P</span> pause
         </div>
       </div>
     </div>
@@ -43,15 +44,14 @@
     <div id="startScreen" class="overlay">
       <div class="panel">
         <h1>MANDEL<span>SURF</span></h1>
-        <p class="tagline">Ride the infinite zoom. Dodge the rock. Chase the foam.</p>
+        <p class="tagline">The camera glides along the fractal coastline as it zooms forever — steer your board along it.</p>
         <div class="controls-list">
-          <div><span class="key">&larr; &rarr;</span> / <span class="key">A D</span> steer</div>
+          <div><span class="key">&larr; &uarr; &darr; &rarr;</span> / <span class="key">WASD</span> steer</div>
           <div><span class="key">SHIFT</span> / <span class="key">SPACE</span> boost</div>
-          <div><span class="key">drag</span> on mobile · <span class="key">tap</span> boost</div>
           <div><span class="key">P</span> pause</div>
         </div>
         <button id="startBtn" class="btn">PADDLE OUT</button>
-        <p class="hint">Stay off the black rock. Ride the bright foam near the edge for bonus score.</p>
+        <p class="hint">Steer toward the reef for foam and big score. Steer away for calmer open water.</p>
       </div>
     </div>
 
@@ -59,27 +59,10 @@
       <div class="panel">
         <h2>PAUSED</h2>
         <button id="resumeBtn" class="btn">RESUME</button>
+        <button id="restartBtn" class="btn btn-secondary">RESTART</button>
       </div>
     </div>
 
-    <div id="gameOverScreen" class="overlay hidden">
-      <div class="panel">
-        <h2>WIPEOUT</h2>
-        <div class="finalstats">
-          <div><span class="stat-label">Score</span><span class="stat-value" id="finalScore">0</span></div>
-          <div><span class="stat-label">Best</span><span class="stat-value" id="finalBest">0</span></div>
-          <div><span class="stat-label">Max Depth</span><span class="stat-value" id="finalDepth">10^0.0×</span></div>
-          <div><span class="stat-label">Reefs Cleared</span><span class="stat-value" id="finalReefs">0</span></div>
-        </div>
-        <button id="retryBtn" class="btn">SURF AGAIN</button>
-      </div>
-    </div>
-
-    <div id="touchControls" class="hidden">
-      <button id="btnLeft" class="tbtn">&larr;</button>
-      <button id="btnBoost" class="tbtn boostbtn">BOOST</button>
-      <button id="btnRight" class="tbtn">&rarr;</button>
-    </div>
   </div>
 
   <script src="game.js"></script>

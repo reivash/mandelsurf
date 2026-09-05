@@ -6,13 +6,13 @@ keeps your board glued to it while the camera dives in forever — steer along
 the edge for score, or peel out to open water to catch your breath. There's
 no way to lose; it's just an endless dive.
 
-<img src="screenshots/gameplay-preview.gif" width="100%" alt="Gameplay preview">
+![The menu — GPU rendering and depth-shift palette selected](screenshots/menu.jpg)
 
 ![Riding the coastline of a mini-brot](screenshots/gameplay-1.jpg)
 
 ![Deeper into a satellite filament](screenshots/gameplay-2.jpg)
 
-![The menu — GPU rendering and depth-shift palette selected](screenshots/menu.jpg)
+<img src="screenshots/gameplay-preview.gif" width="100%" alt="Gameplay preview">
 
 Pure HTML/CSS/JS, no build step, no dependencies.
 
